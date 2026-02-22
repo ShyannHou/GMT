@@ -185,7 +185,8 @@ def run(args):
     for run in range(num_runs):
 
         g_list = []
-        with open(datapath+f'mask_seed_{run}', 'rb') as file:
+        seed_idx = int(getattr(args, 'run_offset', 0)) + run
+        with open(datapath+f'mask_seed_{seed_idx}', 'rb') as file:
             masks_supgraphs_list = pickle.load(file)
         for time_slot in range(num_task):
             with open(datapath+f'sub_graph_{time_slot}_by_edges', 'rb') as file:
@@ -436,6 +437,8 @@ if __name__ == '__main__':
                         help=False)
     parser.add_argument("--num_runs", type=int, default=10,
                         help="number of runs, default = 10")
+    parser.add_argument("--run_offset", type=int, default=0,
+                        help="start index for mask_seed_{i} file (useful to run one seed at a time)")
     parser.add_argument("--num_epochs", type=int, default=50,
                         help="number of training epochs, default = 50")
     parser.add_argument("--lr", type=float, default=1e-2,
