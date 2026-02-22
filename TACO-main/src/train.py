@@ -212,8 +212,12 @@ def run(args):
             gcl_method = DYGRA_meanfeature
         elif args.method == "DYGRA_ringbuffer":
             gcl_method = DYGRA_ringbuffer
-        elif args.method in {"FINETUNE", "SIMPLE_REG", "JOINT"}:
-            gcl_method = None  # handled by baseline branch below
+        elif args.method == "FINETUNE":
+            gcl_method = FINETUNE
+        elif args.method == "SIMPLE_REG":
+            gcl_method = SIMPLE_REG
+        elif args.method == "JOINT":
+            gcl_method = None  # oracle baseline handled below
         else:
             raise ValueError(f"Unknown method: {args.method}")
 
@@ -263,162 +267,98 @@ def run(args):
                 return torch.max(y, 1).indices
             return y
 
-        if args.method in {"FINETUNE", "SIMPLE_REG", "JOINT"}:
+        if args.method == "JOINT":
             # -----------------
-            # Baseline methods
+            # JOINT oracle baseline (uses all tasks)
             # -----------------
-            prev_params = None
+            best_bac = -1.0
+            for epoch in range(args.num_epochs):
+                net.train()
+                for tg in g_list:
+                    g_train = copy.deepcopy(tg)
+                    g_train.add_edges(g_train.nodes(), g_train.nodes())
+                    feats = g_train.ndata['x']
+                    labs = _labels_from_graph(g_train)
+                    m = g_train.ndata['train_mask']
 
-            if args.method == "JOINT":
-                # Oracle-ish joint training: in each epoch, iterate through all tasks
-                # and take one optimizer step per task (roughly comparable total steps
-                # to FINETUNE which trains num_epochs per task).
-                best_bac = -1.0
-                for epoch in range(args.num_epochs):
-                    net.train()
-                    for tg in g_list:
-                        g_train = copy.deepcopy(tg)
-                        g_train.add_edges(g_train.nodes(), g_train.nodes())
-                        feats = g_train.ndata['x']
-                        labs = _labels_from_graph(g_train)
-                        m = g_train.ndata['train_mask']
+                    optimizer.zero_grad()
+                    logits = net(g_train, feats)
+                    loss = loss_func(logits[m], labs[m])
+                    loss.backward()
+                    optimizer.step()
 
-                        optimizer.zero_grad()
-                        logits = net(g_train, feats)
-                        loss = loss_func(logits[m], labs[m])
-                        loss.backward()
-                        optimizer.step()
+                # validation score: mean BAC over tasks
+                net.eval()
+                with torch.no_grad():
+                    avg_valid_bac = 0.0
+                    for vg in g_list:
+                        g_val = copy.deepcopy(vg)
+                        feats_v = g_val.ndata['x']
+                        labs_v = _labels_from_graph(g_val)
+                        m_v = g_val.ndata['valid_mask']
+                        valid_bac, _, _ = evaluate(net, g_val, feats_v, labs_v, m_v)
+                        avg_valid_bac += valid_bac / num_task
+                if avg_valid_bac > best_bac:
+                    best_bac = avg_valid_bac
+                    torch.save(net.state_dict(), best_model_path)
 
-                    # validation score: mean BAC over tasks
-                    net.eval()
-                    with torch.no_grad():
-                        avg_valid_bac = 0.0
-                        for vg in g_list:
-                            g_val = copy.deepcopy(vg)
-                            feats_v = g_val.ndata['x']
-                            labs_v = _labels_from_graph(g_val)
-                            m_v = g_val.ndata['valid_mask']
-                            valid_bac, _, _ = evaluate(net, g_val, feats_v, labs_v, m_v)
-                            avg_valid_bac += valid_bac / num_task
-                    if avg_valid_bac > best_bac:
-                        best_bac = avg_valid_bac
-                        torch.save(net.state_dict(), best_model_path)
+            net.load_state_dict(torch.load(best_model_path))
 
-                net.load_state_dict(torch.load(best_model_path))
-
-                for train_slot in range(num_task):
-                    avg_test_acc, avg_test_bac, avg_test_f1 = 0.0, 0.0, 0.0
-                    for test_slot in range(num_task):
-                        g = g_list[test_slot]
-                        feats = g.ndata['x']
-                        labs = _labels_from_graph(g)
-                        m = g.ndata['test_mask']
-                        test_bac, test_f1, test_acc = evaluate(net, copy.deepcopy(g), feats, labs, m)
-                        avg_test_acc += test_acc / num_task
-                        avg_test_bac += test_bac / num_task
-                        avg_test_f1 += test_f1 / num_task
-                        ave_test_acc_raw[train_slot][test_slot][run] = test_acc
-                        ave_test_bac_raw[train_slot][test_slot][run] = test_bac
-                        ave_test_f1_raw[train_slot][test_slot][run] = test_f1
-                    ave_test_acc_raw[train_slot][-1][run] = avg_test_acc
-                    ave_test_bac_raw[train_slot][-1][run] = avg_test_bac
-                    ave_test_f1_raw[train_slot][-1][run] = avg_test_f1
-
-            else:
-                for train_slot in range(num_task):
-                    print('train_slot:', train_slot)
-
-                    if args.method == "SIMPLE_REG" and train_slot > 0:
-                        prev_params = {n: p.detach().clone() for n, p in net.named_parameters()}
-                    else:
-                        prev_params = None
-
-                    best_bac = -1.0
-                    for epoch in range(args.num_epochs):
-                        net.train()
-                        g_train = copy.deepcopy(g_list[train_slot])
-                        g_train.add_edges(g_train.nodes(), g_train.nodes())
-                        feats = g_train.ndata['x']
-                        labs = _labels_from_graph(g_train)
-                        m_train = g_train.ndata['train_mask']
-
-                        optimizer.zero_grad()
-                        logits = net(g_train, feats)
-                        loss = loss_func(logits[m_train], labs[m_train])
-
-                        if args.method == "SIMPLE_REG" and prev_params is not None and args.simple_reg_lambda > 0:
-                            reg = 0.0
-                            for n, p in net.named_parameters():
-                                reg = reg + (p - prev_params[n].to(p.device)).pow(2).sum()
-                            loss = loss + args.simple_reg_lambda * reg
-
-                        loss.backward()
-                        optimizer.step()
-
-                        # validation on current task
-                        net.eval()
-                        with torch.no_grad():
-                            g_val = copy.deepcopy(g_list[train_slot])
-                            feats_v = g_val.ndata['x']
-                            labs_v = _labels_from_graph(g_val)
-                            m_val = g_val.ndata['valid_mask']
-                            valid_bac, _, _ = evaluate(net, g_val, feats_v, labs_v, m_val)
-                        if valid_bac > best_bac:
-                            best_bac = valid_bac
-                            torch.save(net.state_dict(), best_model_path)
-
-                    net.load_state_dict(torch.load(best_model_path))
-
-                    # test on all tasks
-                    avg_test_acc, avg_test_bac, avg_test_f1 = 0.0, 0.0, 0.0
-                    for test_slot in range(num_task):
-                        g = g_list[test_slot]
-                        feats = g.ndata['x']
-                        labs = _labels_from_graph(g)
-                        m = g.ndata['test_mask']
-                        test_bac, test_f1, test_acc = evaluate(net, copy.deepcopy(g), feats, labs, m)
-                        avg_test_acc += test_acc / num_task
-                        avg_test_bac += test_bac / num_task
-                        avg_test_f1 += test_f1 / num_task
-                        ave_test_acc_raw[train_slot][test_slot][run] = test_acc
-                        ave_test_bac_raw[train_slot][test_slot][run] = test_bac
-                        ave_test_f1_raw[train_slot][test_slot][run] = test_f1
-                    ave_test_acc_raw[train_slot][-1][run] = avg_test_acc
-                    ave_test_bac_raw[train_slot][-1][run] = avg_test_bac
-                    ave_test_f1_raw[train_slot][-1][run] = avg_test_f1
-                    print(avg_test_f1, avg_test_bac)
+            for train_slot in range(num_task):
+                avg_test_acc, avg_test_bac, avg_test_f1 = 0.0, 0.0, 0.0
+                for test_slot in range(num_task):
+                    g = g_list[test_slot]
+                    feats = g.ndata['x']
+                    labs = _labels_from_graph(g)
+                    m = g.ndata['test_mask']
+                    test_bac, test_f1, test_acc = evaluate(net, copy.deepcopy(g), feats, labs, m)
+                    avg_test_acc += test_acc / num_task
+                    avg_test_bac += test_bac / num_task
+                    avg_test_f1 += test_f1 / num_task
+                    ave_test_acc_raw[train_slot][test_slot][run] = test_acc
+                    ave_test_bac_raw[train_slot][test_slot][run] = test_bac
+                    ave_test_f1_raw[train_slot][test_slot][run] = test_f1
+                ave_test_acc_raw[train_slot][-1][run] = avg_test_acc
+                ave_test_bac_raw[train_slot][-1][run] = avg_test_bac
+                ave_test_f1_raw[train_slot][-1][run] = avg_test_f1
 
         else:
+            # -----------------
+            # Pipeline methods (DYGRA/FINETUNE/SIMPLE_REG etc.)
+            # -----------------
             buffer_size = args.buffer_size
             gcl = gcl_method(net, optimizer, num_class, buffer_size, args)
             combined_g_list = []
             for train_slot in range(num_task):
-                print ('train_slot:', train_slot)
+                print('train_slot:', train_slot)
                 g = g_list[train_slot]
-                if args.nfp:
-                    er_buffer = gcl.update_er_buffer(g)
+                if args.nfp and hasattr(gcl, 'update_er_buffer'):
+                    # Different methods have different signatures
+                    try:
+                        er_buffer = gcl.update_er_buffer(g)
+                    except TypeError:
+                        er_buffer = gcl.update_er_buffer(g, train_slot)
                 else:
                     er_buffer = []
+
                 if train_slot == 0:
                     combined_g, c2n, n2c = combine_graph(g, device=device)
                 else:
                     combined_g, c2n, n2c = combine_graph(g, coarsened_g, C, c2n, n2c, device=device)
 
-                replay_nodes = n2c[torch.tensor(er_buffer)]
+                replay_nodes = n2c[torch.tensor(er_buffer)] if len(er_buffer) > 0 else torch.tensor([], device=device).long()
                 combined_g_list.append(combined_g)
 
                 features = combined_g.ndata['x']
-                labels = torch.max(combined_g.ndata['y'],1).indices
-                train_mask = combined_g.ndata['train_mask']
+                labels = torch.max(combined_g.ndata['y'], 1).indices
                 valid_mask = combined_g.ndata['valid_mask']
 
-                all_logits=[]
                 best_bac = 0
-
                 for epoch in range(args.num_epochs):
                     gcl.observe(combined_g_list, train_slot, loss_func)
                     valid_bac, valid_f1, valid_acc = evaluate(gcl, copy.deepcopy(combined_g), features, labels, valid_mask)
                     if valid_bac > best_bac:
+                        best_bac = valid_bac
                         torch.save(net.state_dict(), best_model_path)
 
                 gcl.net.load_state_dict(torch.load(best_model_path))
@@ -428,6 +368,7 @@ def run(args):
                 combined_g_copy.add_edges(combined_g_copy.nodes(), combined_g_copy.nodes())
                 node_hidden_features = gcl.net(combined_g_copy, combined_g_copy.ndata['x']).detach()
                 gcl.net.return_hidden = False
+
                 coarsened_g, C, c2n, n2c = graph_coarsening(
                     combined_g,
                     node_hidden_features,
@@ -442,25 +383,24 @@ def run(args):
 
                 avg_test_acc, avg_test_bac, avg_test_f1 = 0., 0., 0.
                 for test_slot in range(num_task):
-
                     g = g_list[test_slot]
                     features = g.ndata['x']
                     if test_slot <= train_slot:
-                        labels = torch.max(g.ndata['y'],1).indices
+                        labels = torch.max(g.ndata['y'], 1).indices
                     else:
                         labels = g.ndata['y']
                     test_mask = g.ndata['test_mask']
                     test_bac, test_f1, test_acc = evaluate(gcl, copy.deepcopy(g), features, labels, test_mask)
-                    avg_test_acc += test_acc/num_task
-                    avg_test_bac += test_bac/num_task
-                    avg_test_f1 += test_f1/num_task
+                    avg_test_acc += test_acc / num_task
+                    avg_test_bac += test_bac / num_task
+                    avg_test_f1 += test_f1 / num_task
                     ave_test_acc_raw[train_slot][test_slot][run] = test_acc
                     ave_test_bac_raw[train_slot][test_slot][run] = test_bac
                     ave_test_f1_raw[train_slot][test_slot][run] = test_f1
                 ave_test_acc_raw[train_slot][-1][run] = avg_test_acc
                 ave_test_bac_raw[train_slot][-1][run] = avg_test_bac
                 ave_test_f1_raw[train_slot][-1][run] = avg_test_f1
-                print (avg_test_f1, avg_test_bac)
+                print(avg_test_f1, avg_test_bac)
 
         for i in range(num_task):
             ave_test_acc_raw[-1][i][run] = max([ave_test_acc_raw[j][i][run] for j in range(num_task)]) - ave_test_acc_raw[-2][i][run]
