@@ -11,6 +11,11 @@ cd "$(dirname "$0")"
 PY="../.venv_graphcls/bin/python"
 NUM_EPOCHS=${NUM_EPOCHS:-50}
 
+# DYGRA-only MMD alignment opts (opt-in; default off)
+DYGRA_MMD_LAMBDA=${DYGRA_MMD_LAMBDA:-0.0}
+DYGRA_MMD_SAMPLE=${DYGRA_MMD_SAMPLE:-256}
+DYGRA_MMD_BW=${DYGRA_MMD_BW:-1.0}
+
 # seeds 0..9
 SEEDS=${SEEDS:-"0 1 2 3 4 5 6 7 8 9"}
 
@@ -62,7 +67,12 @@ run_method () {
 METHODS=${METHODS:-"DYGRA FINETUNE SIMPLE_REG JOINT"}
 for m in $METHODS; do
   case "$m" in
-    DYGRA) run_method DYGRA ;;
+    DYGRA)
+      run_method DYGRA \
+        --dygra_mmd_lambda "$DYGRA_MMD_LAMBDA" \
+        --dygra_mmd_sample "$DYGRA_MMD_SAMPLE" \
+        --dygra_mmd_bandwidth "$DYGRA_MMD_BW"
+      ;;
     FINETUNE) run_method FINETUNE ;;
     SIMPLE_REG) run_method SIMPLE_REG --simple_reg_lambda 1e-3 ;;
     JOINT) run_method JOINT ;;
@@ -77,7 +87,7 @@ import os, sys, pickle
 import numpy as np
 
 out=sys.argv[1]
-methods=["DYGRA","FINETUNE","SIMPLE_REG","JOINT"]
+methods=os.environ.get("METHODS","DYGRA FINETUNE SIMPLE_REG JOINT").split()
 seeds=list(range(10))
 
 with open(os.path.join(os.path.dirname(out), '..', 'data', 'OURS', 'statistics'), 'rb') as f:
