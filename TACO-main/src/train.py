@@ -505,6 +505,16 @@ if __name__ == '__main__':
     parser.add_argument("--topo_seed", type=int, default=42,
                         help="seed for static topology encoder initialization")
 
+    # -----------------
+    # DYGRA-only MMD modality alignment (GNN vs MoE vs topology/TDA)
+    # -----------------
+    parser.add_argument("--dygra_mmd_lambda", type=float, default=0.01,
+                        help="(DYGRA only) weight for MMD loss added to task loss; set 0 to disable")
+    parser.add_argument("--dygra_mmd_bandwidth", type=float, default=1.0,
+                        help="(DYGRA only) Gaussian kernel bandwidth parameter in MMD")
+    parser.add_argument("--dygra_mmd_sample", type=int, default=256,
+                        help="(DYGRA only) number of train nodes sampled to compute MMD (O(n^2)); 0=use all")
+
     args = parser.parse_args()
 
     run(args)

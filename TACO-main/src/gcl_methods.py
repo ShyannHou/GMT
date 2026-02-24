@@ -16,6 +16,24 @@ import random
 import collections
 
 
+def compute_mmd(x: torch.Tensor, y: torch.Tensor, kernel_bandwidth: float = 1.0) -> torch.Tensor:
+    """Gaussian-kernel Maximum Mean Discrepancy (MMD).
+
+    Adapted from DecAlign (ICLR'26 under review) compute_mmd.
+    x, y: [N, D]
+    """
+    xx = torch.mm(x, x.t())
+    yy = torch.mm(y, y.t())
+    xy = torch.mm(x, y.t())
+    rx = xx.diag().unsqueeze(0).expand_as(xx)
+    ry = yy.diag().unsqueeze(0).expand_as(yy)
+    K_xx = torch.exp(- (rx.t() + rx - 2 * xx) / (2 * kernel_bandwidth))
+    K_yy = torch.exp(- (ry.t() + ry - 2 * yy) / (2 * kernel_bandwidth))
+    K_xy = torch.exp(- (rx.t() + ry - 2 * xy) / (2 * kernel_bandwidth))
+    mmd = K_xx.mean() + K_yy.mean() - 2 * K_xy.mean()
+    return mmd
+
+
 class DYGRA_reservior(torch.nn.Module):
     def __init__(self,
                  model, opt, num_class, buffer_size,
@@ -30,6 +48,9 @@ class DYGRA_reservior(torch.nn.Module):
         self.num_samples = 0
         self.buffer_size = buffer_size
         self.er_buffer = []
+
+        # Optional (DYGRA-only) modality alignment settings
+        self.args = args
 
     def update_er_buffer(self, g):
         train_nodes = g.ndata['train_mask'].nonzero()
@@ -59,9 +80,36 @@ class DYGRA_reservior(torch.nn.Module):
         self.net.train()
         self.net.zero_grad()
 
-        output = self.net(g, features)
+        lam = float(getattr(self.args, 'dygra_mmd_lambda', 0.0))
+        bw = float(getattr(self.args, 'dygra_mmd_bandwidth', 1.0))
+        sample_n = int(getattr(self.args, 'dygra_mmd_sample', 256))
+
+        h = h_moe = topo_h = None
+        if lam > 0:
+            # Only works when the model supports return_parts (e.g., ParallelGNNMoE).
+            try:
+                output, h, h_moe, topo_h = self.net(g, features, return_parts=True)
+            except TypeError:
+                output = self.net(g, features)
+        else:
+            output = self.net(g, features)
+
         output = F.log_softmax(output, 1)
         loss = loss_func((output[train_mask]), labels[train_mask])
+
+        # DYGRA-only modality alignment (MMD) among {GNN hidden, MoE, topology/TDA}.
+        if lam > 0 and (h is not None) and (h_moe is not None) and (topo_h is not None):
+            idx = train_mask.nonzero(as_tuple=False).view(-1)
+            if sample_n > 0 and idx.numel() > sample_n:
+                perm = torch.randperm(idx.numel(), device=idx.device)[:sample_n]
+                idx = idx[perm]
+
+            x = h[idx].float()
+            y = h_moe[idx].float()
+            z = topo_h[idx].float()
+            L_mmd = compute_mmd(x, y, kernel_bandwidth=bw) + compute_mmd(x, z, kernel_bandwidth=bw) + compute_mmd(y, z, kernel_bandwidth=bw)
+            loss = loss + lam * L_mmd
+
         loss.backward()
         self.opt.step()
 
