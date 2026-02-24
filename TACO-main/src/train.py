@@ -508,8 +508,8 @@ if __name__ == '__main__':
     # -----------------
     # DYGRA-only MMD modality alignment (GNN vs MoE vs topology/TDA)
     # -----------------
-    parser.add_argument("--dygra_mmd_lambda", type=float, default=0.01,
-                        help="(DYGRA only) weight for MMD loss added to task loss; set 0 to disable")
+    parser.add_argument("--dygra_mmd_lambda", type=float, default=0.0,
+                        help="(DYGRA only) weight for MMD loss added to task loss; 0 disables")
     parser.add_argument("--dygra_mmd_bandwidth", type=float, default=1.0,
                         help="(DYGRA only) Gaussian kernel bandwidth parameter in MMD")
     parser.add_argument("--dygra_mmd_sample", type=int, default=256,
