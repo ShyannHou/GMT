@@ -1,0 +1,29 @@
+# Data
+data/
+raw-data/
+PEMS04/
+
+# Third-party reference code
+ICML25-TimeVLM-main/
+ASTGCN-2019-mxnet-master/
+
+# Paper PDFs and homework
+*.pdf
+*.tex
+
+# Results and logs
+logs/
+results/
+visualizations/
+best_model_stat_dict
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# OS
+.DS_Store
+.claude/
