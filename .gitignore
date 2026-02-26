@@ -66,6 +66,11 @@ BOOTSTRAP.md
 HEARTBEAT.md
 WORKFLOW_AUTO.md
 
+# Other local project dumps (not needed in GMT)
+CGLB-master/
+ContinualGNN/
+stat207/
+
 # Misc notebooks / homework
 *.ipynb
 *.html
