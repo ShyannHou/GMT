@@ -27,3 +27,50 @@ __pycache__/
 # OS
 .DS_Store
 .claude/
+
+# Local envs / tooling
+.conda/
+.openclaw/
+.venv/
+venv/
+
+# Local memory / logs
+memory/
+
+# Large artifacts
+*.zip
+*.wav
+*_tmp_audio_*.wav
+*_tmp_audio_fflog*.txt
+
+# Subproject (TACO-main) generated outputs / data / env
+TACO-main/.venv_graphcls/
+TACO-main/data/
+TACO-main/results/
+TACO-main/output/
+TACO-main/topology_import_*/
+TACO-main/dropbox_import_*/
+TACO-main/ref_modality_alignment/
+TACO-main/logs/
+TACO-main/visualizations/
+TACO-main/ASTGCN-2019-mxnet-master/
+TACO-main/PEMS04/
+
+# OpenClaw assistant workspace files (not part of GMT code)
+AGENTS.md
+SOUL.md
+USER.md
+TOOLS.md
+IDENTITY.md
+BOOTSTRAP.md
+HEARTBEAT.md
+WORKFLOW_AUTO.md
+
+# Misc notebooks / homework
+*.ipynb
+*.html
+homework_02-*.txt
+homework_02-*_anonymous.md
+STAT201B_HW02_Anonymous.md
+stat201b_homework02_concise.md
+moe_expert1.py
