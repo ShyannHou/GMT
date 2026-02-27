@@ -63,6 +63,14 @@ run_method () {
   done
 }
 
+# NCGL baseline opts
+GEM_N_MEMORIES=${GEM_N_MEMORIES:-100}
+GEM_MARGIN=${GEM_MARGIN:-0.5}
+ERGNN_BUDGET=${ERGNN_BUDGET:-20}
+TWP_LAMBDA_L=${TWP_LAMBDA_L:-10000.0}
+TWP_LAMBDA_T=${TWP_LAMBDA_T:-10000.0}
+TWP_BETA=${TWP_BETA:-0.01}
+
 # resume order (configurable)
 METHODS=${METHODS:-"DYGRA FINETUNE SIMPLE_REG JOINT"}
 for m in $METHODS; do
@@ -74,7 +82,23 @@ for m in $METHODS; do
         --dygra_mmd_bandwidth "$DYGRA_MMD_BW"
       ;;
     FINETUNE) run_method FINETUNE ;;
+    BARE) run_method BARE ;;
     SIMPLE_REG) run_method SIMPLE_REG --simple_reg_lambda 1e-3 ;;
+    GEM)
+      run_method GEM \
+        --gem_n_memories "$GEM_N_MEMORIES" \
+        --gem_memory_strength "$GEM_MARGIN"
+      ;;
+    ERGNN)
+      run_method ERGNN \
+        --ergnn_budget "$ERGNN_BUDGET"
+      ;;
+    TWP)
+      run_method TWP \
+        --twp_lambda_l "$TWP_LAMBDA_L" \
+        --twp_lambda_t "$TWP_LAMBDA_T" \
+        --twp_beta "$TWP_BETA"
+      ;;
     JOINT) run_method JOINT ;;
     *) echo "Unknown method in METHODS: $m"; exit 2 ;;
   esac

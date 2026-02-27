@@ -213,10 +213,17 @@ def run(args):
             gcl_method = DYGRA_meanfeature
         elif args.method == "DYGRA_ringbuffer":
             gcl_method = DYGRA_ringbuffer
-        elif args.method == "FINETUNE":
-            gcl_method = FINETUNE
+        elif args.method in ("FINETUNE", "BARE"):
+            # BARE is an alias of naive finetuning baseline (NCGL naming)
+            gcl_method = FINETUNE if args.method == "FINETUNE" else BARE
         elif args.method == "SIMPLE_REG":
             gcl_method = SIMPLE_REG
+        elif args.method == "ERGNN":
+            gcl_method = ERGNN
+        elif args.method == "GEM":
+            gcl_method = GEM
+        elif args.method == "TWP":
+            gcl_method = TWP
         elif args.method == "JOINT":
             gcl_method = None  # oracle baseline handled below
         else:
@@ -448,7 +455,7 @@ if __name__ == '__main__':
     parser.add_argument('--gnn', type=str, default='GCN',
                         help="basemodel")
     parser.add_argument('--method', type=str, default="DYGRA",
-                        help="GCL method. Options: DYGRA, DYGRA_meanfeature, DYGRA_ringbuffer, FINETUNE, SIMPLE_REG, JOINT")
+                        help="GCL method. Options: DYGRA, DYGRA_meanfeature, DYGRA_ringbuffer, FINETUNE/BARE, SIMPLE_REG, ERGNN, GEM, TWP, JOINT")
     parser.add_argument('--simple_reg_lambda', type=float, default=1e-2,
                         help="lambda for SIMPLE_REG baseline: L_task + lambda * ||theta-theta_prev||^2")
     parser.add_argument("--reduction_rate", type=float, default=0.5,
@@ -474,7 +481,26 @@ if __name__ == '__main__':
                         help="attention dropout")
     parser.add_argument('--negative-slope', type=float, default=0.2,
                         help="the negative slope of leaky relu")
-    parser.add_argument('--buffer_size', type=int, default=200)
+    parser.add_argument('--buffer_size', type=int, default=200,
+                        help="generic buffer size (used by DYGRA/ERGNN etc.)")
+
+    # -----------------
+    # NCGL baselines (CGLB): GEM / ERGNN / TWP
+    # -----------------
+    parser.add_argument('--gem_n_memories', type=int, default=100,
+                        help="(GEM) number of memory samples stored per task")
+    parser.add_argument('--gem_memory_strength', type=float, default=0.5,
+                        help="(GEM) margin (memory_strength) used in the QP projection")
+
+    parser.add_argument('--ergnn_budget', type=int, default=1000,
+                        help="(ERGNN) replay buffer budget (reservoir size); default from CGLB search range")
+
+    parser.add_argument('--twp_lambda_l', type=float, default=10000.0,
+                        help="(TWP) weight for loss-fisher regularization")
+    parser.add_argument('--twp_lambda_t', type=float, default=10000.0,
+                        help="(TWP) weight for attention-fisher regularization (uses MoE gate logits as proxy)")
+    parser.add_argument('--twp_beta', type=float, default=0.01,
+                        help="(TWP) gradient-norm penalty weight")
 
     parser.add_argument("--use_moe", type=bool, default=False,
                         help="whether to use MoE expert layer (strict Eq.10 via AttentionLayer)")

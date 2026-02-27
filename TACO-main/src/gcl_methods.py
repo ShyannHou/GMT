@@ -339,3 +339,376 @@ class SIMPLE_REG(torch.nn.Module):
 
         loss.backward()
         self.opt.step()
+
+
+# -------------------------
+# Additional NCGL baselines
+#   - BARE: naive sequential
+#   - ERGNN: experience replay (node buffer)
+#   - GEM: gradient episodic memory (quadprog)
+#   - TWP: topology-aware weight preservation (fisher + grad-norm)
+#
+# Implementations are adapted to TACO's full-graph + coarsening pipeline and
+# follow the reference implementations in CGLB (NCGL/Baselines).
+# -------------------------
+
+
+class BARE(FINETUNE):
+    """Alias of FINETUNE (naive sequential training) for naming compatibility."""
+
+
+def _store_grad(pp, grads: torch.Tensor, grad_dims, tid: int):
+    """Store current parameter grads into grads[:, tid]."""
+    grads[:, tid].fill_(0.0)
+    cnt = 0
+    for param in pp():
+        if param.grad is not None:
+            beg = 0 if cnt == 0 else sum(grad_dims[:cnt])
+            en = sum(grad_dims[:cnt + 1])
+            grads[beg:en, tid].copy_(param.grad.data.view(-1))
+        cnt += 1
+
+
+def _overwrite_grad(pp, newgrad: torch.Tensor, grad_dims):
+    """Overwrite param.grad with newgrad vector."""
+    cnt = 0
+    for param in pp():
+        if param.grad is not None:
+            beg = 0 if cnt == 0 else sum(grad_dims[:cnt])
+            en = sum(grad_dims[:cnt + 1])
+            this_grad = newgrad[beg:en].contiguous().view(param.grad.data.size())
+            param.grad.data.copy_(this_grad)
+        cnt += 1
+
+
+def _project2cone2(gradient: torch.Tensor, memories: torch.Tensor, margin: float = 0.5, eps: float = 1e-3):
+    """GEM projection via the dual QP (quadprog), adapted from CGLB."""
+    # memories: [p, t]
+    memories_np = memories.detach().cpu().t().double().numpy()
+    gradient_np = gradient.detach().cpu().contiguous().view(-1).double().numpy()
+    t = memories_np.shape[0]
+
+    P = memories_np @ memories_np.T
+    P = 0.5 * (P + P.T) + np.eye(t) * eps
+    q = (memories_np @ gradient_np) * -1
+    G = np.eye(t)
+    h = np.zeros(t) + margin
+    v = quadprog.solve_qp(P, q, G, h)[0]
+    x = v @ memories_np + gradient_np
+
+    gradient.copy_(torch.tensor(x, dtype=gradient.dtype, device=gradient.device).view(-1, 1))
+
+
+class GEM(torch.nn.Module):
+    """Gradient Episodic Memory (GEM) baseline.
+
+    Notes for this codebase:
+      - We store a small memory set (features+labels) per task.
+      - Old-task gradients are computed on the stored memory graphs (self-loops only).
+      - Current-task gradient is projected (quadprog) to not interfere with past tasks.
+
+    Reference: CGLB/NCGL/Baselines/gem_model.py (+ gem_utils.py).
+    """
+
+    def __init__(self, model, opt, num_class, buffer_size, args):
+        super().__init__()
+        self.net = model
+        self.opt = opt
+        self.args = args
+
+        self.margin = float(getattr(args, 'gem_memory_strength', 0.5))
+        self.n_memories = int(getattr(args, 'gem_n_memories', 100))
+
+        self.observed_tasks = []
+        self.current_task = -1
+
+        self.memory_feats = []   # list[t] -> Tensor [M, D]
+        self.memory_labels = []  # list[t] -> Tensor [M]
+
+        self.grad_dims = [p.data.numel() for p in self.net.parameters()]
+        self.grads = None  # allocated lazily: [sum_dims, num_tasks]
+
+    def update_er_buffer(self, g):
+        # GEM does not require replay_nodes for coarsening (kept empty for fairness).
+        return []
+
+    def forward(self, g, features):
+        return self.net(g, features)
+
+    def _ensure_grads(self, num_tasks: int, device: torch.device):
+        if self.grads is None or self.grads.size(1) < num_tasks:
+            self.grads = torch.zeros(sum(self.grad_dims), num_tasks, device=device)
+
+    def _maybe_update_memory(self, g: dgl.DGLGraph, t: int):
+        # Called once per task (first time we see t). Sample memory from current train set.
+        train_nodes = g.ndata['train_mask'].nonzero(as_tuple=False).view(-1)
+        if train_nodes.numel() == 0:
+            feats = g.ndata['x'][:0]
+            labs = torch.zeros((0,), device=g.device, dtype=torch.long)
+        else:
+            k = min(self.n_memories, train_nodes.numel())
+            perm = torch.randperm(train_nodes.numel(), device=train_nodes.device)[:k]
+            idx = train_nodes[perm]
+            feats = g.ndata['x'][idx].detach().clone()
+            y = g.ndata['y']
+            labs = (torch.max(y, 1).indices if y.dim() == 2 else y).detach().clone()[idx]
+
+        while len(self.memory_feats) <= t:
+            self.memory_feats.append(None)
+            self.memory_labels.append(None)
+        self.memory_feats[t] = feats
+        self.memory_labels[t] = labs
+
+    def _loss_on_memory(self, feats: torch.Tensor, labs: torch.Tensor, loss_func):
+        # Self-loop-only replay graph
+        n = feats.size(0)
+        g_rp = dgl.graph(([], []), num_nodes=n, device=feats.device)
+        if n > 0:
+            nodes = torch.arange(n, device=feats.device)
+            g_rp.add_edges(nodes, nodes)
+        logits = self.net(g_rp, feats)
+        out = F.log_softmax(logits, 1)
+        return loss_func(out, labs)
+
+    def observe(self, g_list, t, loss_func):
+        g = copy.deepcopy(g_list[t])
+        g.add_edges(g.nodes(), g.nodes())
+        features = g.ndata['x']
+        labels = torch.max(g.ndata['y'], 1).indices
+        train_mask = g.ndata['train_mask']
+
+        self.net.train()
+
+        self._ensure_grads(num_tasks=len(g_list), device=features.device)
+
+        # task boundary
+        if t != self.current_task:
+            self.observed_tasks.append(t)
+            self.current_task = t
+            self._maybe_update_memory(g, t)
+
+        # 1) gradients on past task memories
+        for old_t in self.observed_tasks[:-1]:
+            feats_old = self.memory_feats[old_t]
+            labs_old = self.memory_labels[old_t]
+            if feats_old is None or feats_old.numel() == 0:
+                continue
+            self.net.zero_grad()
+            loss_old = self._loss_on_memory(feats_old, labs_old, loss_func)
+            loss_old.backward()
+            _store_grad(self.net.parameters, self.grads, self.grad_dims, old_t)
+
+        # 2) gradient on current task
+        self.net.zero_grad()
+        logits = self.net(g, features)
+        out = F.log_softmax(logits, 1)
+        loss = loss_func(out[train_mask], labels[train_mask])
+        loss.backward()
+
+        # 3) project if constraints violated
+        if len(self.observed_tasks) > 1:
+            _store_grad(self.net.parameters, self.grads, self.grad_dims, t)
+            indx = torch.tensor(self.observed_tasks[:-1], device=features.device, dtype=torch.long)
+            dotp = torch.mm(self.grads[:, t].unsqueeze(0), self.grads.index_select(1, indx))
+            if (dotp < 0).any():
+                _project2cone2(self.grads[:, t].unsqueeze(1), self.grads.index_select(1, indx), margin=self.margin)
+                _overwrite_grad(self.net.parameters, self.grads[:, t], self.grad_dims)
+
+        self.opt.step()
+
+
+class ERGNN(torch.nn.Module):
+    """Experience Replay GNN (ER-GNN) baseline.
+
+    We implement a simplified ER-GNN variant suitable for TACO's pipeline:
+      - Maintain a reservoir buffer of training nodes (for coarsening fidelity) via node_idxs.
+      - Additionally store (feature,label) for replay training on a self-loop graph.
+
+    Reference: CGLB/NCGL/Baselines/ergnn_model.py.
+    """
+
+    def __init__(self, model, opt, num_class, buffer_size, args):
+        super().__init__()
+        self.net = model
+        self.opt = opt
+        self.args = args
+
+        self.buffer_size = int(getattr(args, 'ergnn_budget', buffer_size))
+        self.num_samples = 0
+        self.er_buffer = []  # stores original node_idxs (ints) for coarsening
+        self.replay_feats = []
+        self.replay_labels = []
+
+    def update_er_buffer(self, g: dgl.DGLGraph):
+        train_nodes = g.ndata['train_mask'].nonzero(as_tuple=False).view(-1)
+        y = g.ndata['y']
+        y_int = torch.max(y, 1).indices if y.dim() == 2 else y
+
+        for node in train_nodes:
+            node = int(node.item())
+            node_idx = int(g.ndata['node_idxs'][node].item())
+            feat = g.ndata['x'][node].detach().clone()
+            lab = int(y_int[node].item())
+
+            self.num_samples += 1
+            if len(self.er_buffer) < self.buffer_size:
+                self.er_buffer.append(node_idx)
+                self.replay_feats.append(feat)
+                self.replay_labels.append(lab)
+            else:
+                rand_idx = random.randint(0, self.num_samples - 1)
+                if rand_idx < self.buffer_size:
+                    self.er_buffer[rand_idx] = node_idx
+                    self.replay_feats[rand_idx] = feat
+                    self.replay_labels[rand_idx] = lab
+
+        return self.er_buffer
+
+    def forward(self, g, features):
+        return self.net(g, features)
+
+    def observe(self, g_list, t, loss_func):
+        g = copy.deepcopy(g_list[t])
+        g.add_edges(g.nodes(), g.nodes())
+        features = g.ndata['x']
+        labels = torch.max(g.ndata['y'], 1).indices
+        train_mask = g.ndata['train_mask']
+
+        self.net.train()
+        self.net.zero_grad()
+
+        logits = self.net(g, features)
+        out = F.log_softmax(logits, 1)
+        loss_cur = loss_func(out[train_mask], labels[train_mask])
+
+        # Replay loss (self-loop graph), weighted as in ER-GNN (beta = B/(B+N)).
+        if t > 0 and len(self.replay_feats) > 0:
+            feats_rp = torch.stack([f.squeeze(0) if f.dim() == 2 else f for f in self.replay_feats], dim=0).to(features.device)
+            labs_rp = torch.tensor(self.replay_labels, device=features.device, dtype=torch.long)
+            n = feats_rp.size(0)
+            g_rp = dgl.graph(([], []), num_nodes=n, device=features.device)
+            if n > 0:
+                nodes = torch.arange(n, device=features.device)
+                g_rp.add_edges(nodes, nodes)
+            logits_rp = self.net(g_rp, feats_rp)
+            out_rp = F.log_softmax(logits_rp, 1)
+            loss_rp = loss_func(out_rp, labs_rp)
+
+            n_nodes = int(train_mask.sum().item())
+            beta = float(n) / float(max(n + n_nodes, 1))
+            loss = beta * loss_cur + (1.0 - beta) * loss_rp
+        else:
+            loss = loss_cur
+
+        loss.backward()
+        self.opt.step()
+
+
+class TWP(torch.nn.Module):
+    """Topology-aware Weight Preservation (TWP) baseline.
+
+    We adapt the CGLB implementation to this codebase:
+      - fisher_loss: per-parameter squared gradients of task loss at the end of each task.
+      - fisher_att: squared gradients of an "attention proxy" (here: MoE gate logits if present; otherwise logits norm).
+      - Regularize parameters to stay near previous optima.
+
+    Reference: CGLB/NCGL/Baselines/twp_model.py.
+    """
+
+    def __init__(self, model, opt, num_class, buffer_size, args):
+        super().__init__()
+        self.net = model
+        self.opt = opt
+        self.args = args
+
+        self.lambda_l = float(getattr(args, 'twp_lambda_l', 10000.0))
+        self.lambda_t = float(getattr(args, 'twp_lambda_t', 10000.0))
+        self.beta = float(getattr(args, 'twp_beta', 0.01))
+
+        self.epochs = 0
+        self.fisher_loss = {}
+        self.fisher_att = {}
+        self.optpar = {}
+
+    def update_er_buffer(self, g):
+        return []
+
+    def forward(self, g, features):
+        return self.net(g, features)
+
+    def _attention_proxy(self, logits: torch.Tensor):
+        # Prefer MoE gate logits if available (connected to graph).
+        moe = getattr(self.net, 'moe', None)
+        if moe is not None and getattr(moe, 'last_gate_logits', None) is not None:
+            return moe.last_gate_logits
+        return logits
+
+    def observe(self, g_list, t, loss_func):
+        self.epochs += 1
+        last_epoch = self.epochs % int(getattr(self.args, 'num_epochs', 50))
+
+        g = copy.deepcopy(g_list[t])
+        g.add_edges(g.nodes(), g.nodes())
+        features = g.ndata['x']
+        labels = torch.max(g.ndata['y'], 1).indices
+        train_mask = g.ndata['train_mask']
+
+        self.net.train()
+
+        # Train step with TWP regularization
+        self.net.zero_grad()
+        logits = self.net(g, features)
+        out = F.log_softmax(logits, 1)
+        loss = loss_func(out[train_mask], labels[train_mask])
+
+        # First backward to get gradients for grad-norm (official-style)
+        loss.backward(retain_graph=True)
+        grad_norm = 0.0
+        for p in self.net.parameters():
+            if p.grad is None:
+                continue
+            grad_norm = grad_norm + torch.norm(p.grad.data.clone(), p=1)
+
+        # Quadratic penalties from previous tasks
+        for tt in range(t):
+            if tt not in self.fisher_loss:
+                continue
+            for i, p in enumerate(self.net.parameters()):
+                l = self.lambda_l * self.fisher_loss[tt][i] + self.lambda_t * self.fisher_att[tt][i]
+                l = l.to(p.device) * (p - self.optpar[tt][i].to(p.device)).pow(2)
+                loss = loss + l.sum()
+
+        loss = loss + self.beta * grad_norm
+
+        # Second backward accumulates the full objective gradients
+        loss.backward()
+        self.opt.step()
+
+        # At task boundary (end of task training), estimate fisher terms
+        if last_epoch == 0:
+            self.net.zero_grad()
+            logits2 = self.net(g, features)
+            out2 = F.log_softmax(logits2, 1)
+            loss2 = loss_func(out2[train_mask], labels[train_mask])
+            loss2.backward(retain_graph=True)
+
+            self.fisher_loss[t] = []
+            self.fisher_att[t] = []
+            self.optpar[t] = []
+            for p in self.net.parameters():
+                self.optpar[t].append(p.data.detach().clone())
+                if p.grad is None:
+                    self.fisher_loss[t].append(torch.zeros_like(p.data))
+                else:
+                    self.fisher_loss[t].append(p.grad.data.detach().clone().pow(2))
+
+            # attention proxy fisher
+            att = self._attention_proxy(logits2)
+            eloss = torch.norm(att)
+            self.net.zero_grad()
+            eloss.backward()
+            for p in self.net.parameters():
+                if p.grad is None:
+                    self.fisher_att[t].append(torch.zeros_like(p.data))
+                else:
+                    self.fisher_att[t].append(p.grad.data.detach().clone().pow(2))
